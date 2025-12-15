@@ -6,8 +6,8 @@ const nextConfig = {
         source: '/api/:path*',
         destination:
           process.env.NODE_ENV === 'development'
-            ? 'http://127.0.0.1:5328/api/:path*' // Untuk development lokal
-            : '/api/', // Untuk produksi di Vercel
+            ? 'http://127.0.0.1:5328/api/:path*' // Dev: Arahkan ke Flask lokal
+            : '/api/:path*', // Prod: Pertahankan path asli agar dibaca Vercel Function
       },
     ]
   },
