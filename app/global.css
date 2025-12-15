@@ -1,9 +1,0 @@
-/* Import Leaflet CSS secara Global */
-@import "leaflet/dist/leaflet.css";
-
-/* Pastikan container peta memiliki tinggi */
-.leaflet-container {
-  width: 100%;
-  height: 500px;
-  z-index: 1;
-}
