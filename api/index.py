@@ -1,140 +1,180 @@
-from flask import Flask, request, jsonify
+from flask import Flask, jsonify, request
 import pandas as pd
+import numpy as np
 import os
 from sklearn.cluster import KMeans
-from sklearn.preprocessing import StandardScaler
-import folium
+from statsmodels.tsa.statespace.sarimax import SARIMAX
+import warnings
+
+# Matikan warning statsmodels agar terminal bersih
+warnings.filterwarnings("ignore")
 
 app = Flask(__name__)
 
-# --- 1. KOORDINAT REFERENCE (GLOBAL SCOPE) ---
-# Data ini diletakkan di luar fungsi agar bisa diakses kapan saja
-koordinat_semarang = {
-    'mijen': [-7.0601, 110.3168],
-    'gunungpati': [-7.1082, 110.3842],
-    'banyumanik': [-7.0706, 110.4228],
-    'gajah mungkur': [-7.0267, 110.4129],
-    'semarang selatan': [-6.9964, 110.4196],
-    'semarang barat': [-6.9859, 110.3952],
-    'semarang utara': [-6.9631, 110.4262],
-    'semarang tengah': [-6.9813, 110.4265],
-    'semarang timur': [-6.9745, 110.4418],
-    'gayamsari': [-6.9797, 110.4573],
-    'genuk': [-6.9616, 110.4801],
-    'pedurungan': [-7.0055, 110.4727],
-    'tembalang': [-7.0603, 110.4573],
-    'candisari': [-7.0163, 110.4300],
-    'ngaliyan': [-7.0094, 110.3340],
-    'tugu': [-6.9754, 110.3308]
+# ==========================================
+# 1. KONFIGURASI
+# ==========================================
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+DATA_DIR = os.path.join(BASE_DIR, '../Data')
+
+KOORDINAT_KECAMATAN = {
+    "Semarang Tengah": {"lat": -6.9808, "lon": 110.4194},
+    "Semarang Utara": {"lat": -6.9634, "lon": 110.4208},
+    "Semarang Selatan": {"lat": -6.9959, "lon": 110.4203},
+    "Semarang Barat": {"lat": -6.9856, "lon": 110.3946},
+    "Semarang Timur": {"lat": -6.9723, "lon": 110.4361},
+    "Gajahmungkur": {"lat": -7.0094, "lon": 110.4078},
+    "Genuk": {"lat": -6.9631, "lon": 110.4578},
+    "Pedurungan": {"lat": -7.0016, "lon": 110.4703},
+    "Tembalang": {"lat": -7.0494, "lon": 110.4583},
+    "Banyumanik": {"lat": -7.0628, "lon": 110.4172},
+    "Candisari": {"lat": -7.0165, "lon": 110.4312},
+    "Gunungpati": {"lat": -7.0890, "lon": 110.3920},
+    "Mijen": {"lat": -7.0610, "lon": 110.3160},
+    "Ngaliyan": {"lat": -6.9980, "lon": 110.3370},
+    "Tugu": {"lat": -6.9750, "lon": 110.3310},
+    "Gayamsari": {"lat": -6.9830, "lon": 110.4510}
 }
 
-def get_lat(nama):
-    # Mengambil latitude, default None jika tidak ditemukan
-    return koordinat_semarang.get(str(nama).lower().strip(), [None, None])[0]
+model_sarima = None
+model_cluster = None
+df_global = pd.DataFrame()
 
-def get_long(nama):
-    # Mengambil longitude, default None jika tidak ditemukan
-    return koordinat_semarang.get(str(nama).lower().strip(), [None, None])[1]
+# ==========================================
+# 2. LOGIKA DATA & MODEL
+# ==========================================
+def generate_monthly_data(yearly_df):
+    """
+    Helper: Mengubah data Tahunan menjadi Bulanan untuk keperluan Time Series SARIMA.
+    """
+    monthly_data = []
+    for _, row in yearly_df.iterrows():
+        year = int(row['Tahun'])
+        total_kasus = row['Jumlah_Kasus']
+        
+        # Pola musiman simulasi (Januari tinggi, tengah tahun rendah)
+        weights = [0.15, 0.12, 0.10, 0.08, 0.05, 0.04, 0.04, 0.05, 0.06, 0.08, 0.10, 0.13]
+        
+        for month in range(1, 13):
+            kasus_bulan = int(total_kasus * weights[month-1])
+            monthly_data.append({
+                'Date': pd.Timestamp(f"{year}-{month}-01"),
+                'Jumlah_Kasus': kasus_bulan
+            })
+    return pd.DataFrame(monthly_data)
 
-# --- 2. ROUTE FLASK UTAMA ---
-@app.route('/api/analyze', methods=['GET'])
-def analyze():
+def load_and_train():
+    global model_sarima, model_cluster, df_global
+    
+    files = {2022: 'DataDBD_2022.xlsx', 2023: 'DataDBD_2023.xlsx', 2024: 'DataDBD_2024.xlsx', 2025: 'DataDBD_2025.xlsx'}
+    all_data = []
+
+    # 1. BACA EXCEL
+    for year, filename in files.items():
+        path = os.path.join(DATA_DIR, filename)
+        if os.path.exists(path):
+            try:
+                df = pd.read_excel(path)
+                df['Tahun'] = str(year)
+                all_data.append(df)
+            except Exception as e:
+                print(f"Skip {filename}: {e}")
+
+    if not all_data: return
+
+    combined_df = pd.concat(all_data, ignore_index=True)
+    df_global = combined_df 
+
+    # 2. TRAINING KLASTERISASI (K-MEANS)
+    X_cluster = combined_df[['Jumlah_Kasus']]
+    kmeans = KMeans(n_clusters=3, random_state=42).fit(X_cluster)
+    
+    centroids = kmeans.cluster_centers_.flatten()
+    sorted_idx = np.argsort(centroids)
+    cluster_map = {sorted_idx[0]: 'Rendah', sorted_idx[1]: 'Sedang', sorted_idx[2]: 'Tinggi'}
+    model_cluster = {'model': kmeans, 'mapping': cluster_map}
+
+    # 3. TRAINING PREDIKSI (SARIMA) - MURNI (TANPA EXOGENOUS)
+    yearly_sum = combined_df.groupby('Tahun')[['Jumlah_Kasus']].sum().reset_index()
+    ts_df = generate_monthly_data(yearly_sum)
+    ts_df = ts_df.set_index('Date')
+    
+    y = ts_df['Jumlah_Kasus'] # Hanya menggunakan data kasus
+    
     try:
-        # A. Ambil Parameter Tahun dari URL (contoh: /api/analyze?year=2023)
-        tahun = request.args.get('year', '2025')
-        
-        # B. Tentukan Path File
-        # Folder 'api' ada di dalam root, jadi kita mundur satu level (..) ke folder 'data'
-        base_dir = os.path.dirname(os.path.abspath(__file__))
-        file_path = os.path.join(base_dir, '..', 'data', f'DataDBD_{tahun}.xlsx')
-        
-        # Cek ketersediaan file
-        if not os.path.exists(file_path):
-            return jsonify({"error": f"Data tahun {tahun} tidak ditemukan di {file_path}"}), 404
+        # Order=(p,d,q) dan Seasonal=(P,D,Q,s)
+        # Menghapus parameter 'exog'
+        model = SARIMAX(y, order=(1, 1, 1), seasonal_order=(1, 1, 1, 12))
+        model_fit = model.fit(disp=False)
+        model_sarima = model_fit
+        print("Model SARIMA berhasil dilatih (Tanpa Variabel Luar).")
+    except Exception as e:
+        print(f"Gagal latih SARIMA: {e}")
 
-        # C. Baca & Bersihkan Data
-        df = pd.read_excel(file_path, skiprows=2)
-        
-        # Hapus kolom index 'Unnamed' jika ada
-        if 'Unnamed: 0' in df.columns: 
-            df = df.drop('Unnamed: 0', axis=1)
-        
-        # Standarisasi Nama Kolom
-        new_column_names = [
-            'wilayah', 'jml penduduk',
-            'jan p', 'jan m', 'feb p', 'feb m', 'mar p', 'mar m',
-            'apr p', 'apr m', 'mei p', 'mei m', 'jun p', 'jun m',
-            'jul p', 'jul m', 'agt p', 'agt m', 'sep p', 'sep m',
-            'okt p', 'okt m', 'nov p', 'nov m', 'des p', 'des m',
-            'jml p', 'jml m', 'ir/100000', 'cfr'
-        ]
-        
-        # Potong kolom jika di Excel lebih banyak dari yang kita definisikan
-        if len(df.columns) > len(new_column_names): 
-            df = df.iloc[:, :len(new_column_names)]
-            
-        df.columns = new_column_names
-        
-        # Bersihkan baris total/kosong (berdasarkan kolom jml penduduk)
-        df = df[pd.to_numeric(df['jml penduduk'], errors='coerce').notnull()]
+load_and_train()
 
-        # D. Tambah Koordinat ke DataFrame
-        df['Latitude'] = df['wilayah'].apply(get_lat)
-        df['Longitude'] = df['wilayah'].apply(get_long)
-        
-        # Isi koordinat default (Semarang Kota) jika nama kecamatan salah ketik/tidak ada
-        df['Latitude'] = df['Latitude'].fillna(-7.0051)
-        df['Longitude'] = df['Longitude'].fillna(110.4381)
+# ==========================================
+# 3. API ENDPOINTS
+# ==========================================
 
-        # E. Logic Clustering (K-Means)
-        features = ['ir/100000', 'cfr', 'jml p']
-        X = df[features].fillna(0)
-        
-        scaler = StandardScaler()
-        X_scaled = scaler.fit_transform(X)
-        
-        kmeans = KMeans(n_clusters=3, random_state=42, n_init=10)
-        df['Cluster'] = kmeans.fit_predict(X_scaled)
-        
-        # Labeling (Mapping cluster 0,1,2 menjadi Rendah, Sedang, Tinggi berdasarkan IR rata-rata)
-        summary = df.groupby('Cluster')['ir/100000'].mean().sort_values()
-        risk_map = {idx: label for idx, label in zip(summary.index, ['Rendah', 'Sedang', 'Tinggi'])}
-        df['Status_Risiko'] = df['Cluster'].map(risk_map)
+@app.route('/api/dashboard-data', methods=['GET'])
+def get_dashboard_data():
+    if df_global.empty: return jsonify({"error": "Data kosong"}), 404
 
-        # F. Buat Peta Folium
-        m = folium.Map(location=[-7.0051, 110.4381], zoom_start=11)
-        colors = {'Rendah': 'green', 'Sedang': 'orange', 'Tinggi': 'red'}
-        
-        for _, row in df.iterrows():
-            warna = colors.get(row['Status_Risiko'], 'gray')
-            
-            # HTML Popup
-            popup_html = f"""
-            <div style='font-family:sans-serif; width:150px'>
-                <b>{str(row['wilayah']).title()}</b><br>
-                Status: <b>{row['Status_Risiko']}</b><br>
-                IR: {row['ir/100000']:.2f}<br>
-                CFR: {row['cfr']:.2f}%
-            </div>
-            """
-            
-            folium.CircleMarker(
-                location=[row['Latitude'], row['Longitude']],
-                radius=8 + (row['ir/100000'] * 0.05), # Radius dinamis
-                color=warna, fill=True, fill_color=warna, fill_opacity=0.7,
-                popup=folium.Popup(popup_html, max_width=200)
-            ).add_to(m)
+    # A. Tren Tahunan
+    trend = df_global.groupby('Tahun')[['Jumlah_Kasus', 'Kematian']].sum().reset_index()
+    
+    # B. Peta Sebaran (Tahun Terakhir)
+    latest_year = df_global['Tahun'].max()
+    latest_df = df_global[df_global['Tahun'] == latest_year].copy()
+    
+    if model_cluster:
+        preds = model_cluster['model'].predict(latest_df[['Jumlah_Kasus']])
+        latest_df['Status'] = [model_cluster['mapping'][p] for p in preds]
+    
+    map_data = []
+    for _, row in latest_df.iterrows():
+        kec = row.get('Kecamatan')
+        if kec in KOORDINAT_KECAMATAN:
+            map_data.append({
+                "Kecamatan": kec,
+                "Latitude": KOORDINAT_KECAMATAN[kec]['lat'],
+                "Longitude": KOORDINAT_KECAMATAN[kec]['lon'],
+                "Jumlah_Kasus": row.get('Jumlah_Kasus', 0),
+                "Cluster": row.get('Status', 'Unknown')
+            })
 
-        # G. Return Data ke Next.js
+    return jsonify({"tren_tahunan": trend.to_dict(orient='records'), "sebaran_peta": map_data})
+
+@app.route('/api/predict', methods=['POST'])
+def predict():
+    if not model_sarima:
+        return jsonify({"error": "Model SARIMA belum siap"}), 500
+
+    # Kita tetap menerima data input, tapi TIDAK menggunakannya untuk prediksi
+    data = request.json 
+    
+    try:
+        # Prediksi 1 langkah ke depan (Bulan Depan) berdasarkan pola waktu saja
+        # Tidak ada parameter 'exog' di sini
+        forecast = model_sarima.get_forecast(steps=1)
+        pred_value = forecast.predicted_mean.iloc[0]
+        
+        pred_value = max(0, pred_value) # Hindari nilai negatif
+        
+        status = "AMAN"
+        if pred_value > 50: status = "WASPADA"
+        if pred_value > 150: status = "BAHAYA"
+
         return jsonify({
-            "map_html": m._repr_html_(),
-            "data": df[['wilayah', 'ir/100000', 'cfr', 'Status_Risiko']].to_dict(orient='records')
+            "score": round(pred_value, 2),
+            "status": status,
+            "note": "Prediksi murni berdasarkan Tren Historis (SARIMA)"
         })
 
     except Exception as e:
-        print(f"Error: {e}") # Print error ke terminal untuk debugging
-        return jsonify({"error": str(e)}), 500
+        print(f"Error prediksi: {e}")
+        return jsonify({"error": str(e)}), 400
 
-# --- 3. JALANKAN SERVER (HANYA UNTUK LOCALHOST) ---
 if __name__ == "__main__":
-    app.run(debug=True, port=5328)
+    app.run(port=5328, debug=True)
