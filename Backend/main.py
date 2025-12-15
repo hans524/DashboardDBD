@@ -4,6 +4,9 @@ from model_logic import process_clustering
 import uvicorn
 
 app = FastAPI()
+@app.get("/")
+async def root():
+    return {"message": "Backend Dashboard DBD Semarang Aktif", "status": "running"}
 
 # Izinkan Frontend mengakses API
 app.add_middleware(
